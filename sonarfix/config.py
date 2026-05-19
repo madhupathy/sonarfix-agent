@@ -27,8 +27,11 @@ class Settings(BaseSettings):
     llm_base_url: str = "http://localhost:8000/v1"
     llm_timeout: float = 600.0
 
+    # SSL verification (set SSL_VERIFY=false to disable, e.g. for self-signed certs)
+    ssl_verify: bool = True
+
     # Workspace
-    workspace_dir: Path = Path("/tmp/sonarfix-workspaces")
+    workspace_dir: Path = Path.home() / ".sonarfix" / "workspaces"
 
     # Git
     git_push_remote: str = "origin"

@@ -88,12 +88,13 @@ class LLMFixer:
             "max_tokens": 8192,
         }
 
+        from sonarfix.config import get_settings
         resp = httpx.post(
             url,
             headers=headers,
             json=payload,
             timeout=self.timeout,
-            verify=False,
+            verify=get_settings().ssl_verify,
         )
         if resp.status_code != 200:
             body = resp.text[:500]

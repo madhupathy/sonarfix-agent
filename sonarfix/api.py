@@ -25,11 +25,16 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# In-memory stores (lightweight, no DB needed)
+# In-memory stores + SQLite-backed job persistence
 # ---------------------------------------------------------------------------
 
+from sonarfix import db as _job_db  # noqa: E402 — must come after stdlib imports
+
 _connections: Dict[str, Dict[str, Any]] = {}
-_jobs: Dict[str, Dict[str, Any]] = {}
+# Jobs are kept in memory for fast access and persisted to SQLite for restart survival
+_jobs: Dict[str, Dict[str, Any]] = _job_db.load_jobs()
+# Set of job IDs that have been requested to cancel
+_cancelled_jobs: set = set()
 _settings_path = Path.home() / ".sonarfix" / "connections.json"
 
 
@@ -213,6 +218,7 @@ def test_connection(connector: str, config: ConnectionConfig):
 
 def _test_sonarqube(config: ConnectionConfig) -> dict:
     import httpx
+    from sonarfix.config import get_settings
     url = (config.url or "").rstrip("/")
     if not url:
         return {"success": False, "message": "URL is required"}
@@ -222,7 +228,7 @@ def _test_sonarqube(config: ConnectionConfig) -> dict:
             auth = (config.username, config.password)
         elif config.auth_type == "token" and config.token:
             auth = (config.token, "")
-        r = httpx.get(f"{url}/api/system/status", auth=auth, verify=False, timeout=10)
+        r = httpx.get(f"{url}/api/system/status", auth=auth, verify=get_settings().ssl_verify, timeout=10)
         if r.status_code == 200:
             data = r.json()
             return {"success": True, "message": f"Connected — {data.get('status', 'UP')}"}
@@ -238,6 +244,7 @@ def _test_llm(config: ConnectionConfig) -> dict:
     # Try a lightweight LLM API call to verify the key works
     try:
         import httpx
+        from sonarfix.config import get_settings
         base_url = (config.llm_base_url or "https://api.openai.com/v1").rstrip("/")
         model = config.llm_model or "gpt-4o"
         resp = httpx.post(
@@ -245,7 +252,7 @@ def _test_llm(config: ConnectionConfig) -> dict:
             headers={"Authorization": f"Bearer {llm_key}", "Content-Type": "application/json"},
             json={"model": model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 5},
             timeout=15.0,
-            verify=False,
+            verify=get_settings().ssl_verify,
         )
         if resp.status_code == 200:
             return {"success": True, "message": f"LLM API connected (model: {model})"}
@@ -303,6 +310,12 @@ def _sync_env():
 # ---------------------------------------------------------------------------
 
 
+def _persist_job(job: Dict[str, Any]) -> None:
+    """Write a job to the in-memory dict and to SQLite."""
+    _jobs[job["id"]] = job
+    _job_db.save_job(job)
+
+
 @app.post("/api/jobs")
 def create_job(req: FixJobRequest):
     """Start a fix job (runs in background thread)."""
@@ -315,7 +328,7 @@ def create_job(req: FixJobRequest):
         "log": [],
         "result": None,
     }
-    _jobs[job_id] = job
+    _persist_job(job)
 
     thread = threading.Thread(target=_run_job, args=(job_id,), daemon=True)
     thread.start()
@@ -324,10 +337,31 @@ def create_job(req: FixJobRequest):
 
 
 @app.get("/api/jobs")
-def list_jobs():
-    """List all jobs (newest first)."""
-    jobs = sorted(_jobs.values(), key=lambda j: j["created_at"], reverse=True)
-    return {"jobs": [{k: v for k, v in j.items() if k != "log"} for j in jobs[:50]]}
+def list_jobs(limit: int = 50, offset: int = 0):
+    """List jobs (newest first) with pagination via limit/offset query params."""
+    paged = _job_db.list_jobs_paged(limit=limit, offset=offset)
+    total = _job_db.count_jobs()
+    return {
+        "jobs": [{k: v for k, v in j.items() if k != "log"} for j in paged],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.delete("/api/jobs/{job_id}")
+def cancel_job(job_id: str):
+    """Cancel a running or queued job."""
+    if job_id not in _jobs:
+        raise HTTPException(404, "Job not found")
+    job = _jobs[job_id]
+    if job.get("status") in ("completed", "failed", "cancelled"):
+        return {"status": job["status"], "message": "Job already finished"}
+    # Signal cancellation — background thread checks this set
+    _cancelled_jobs.add(job_id)
+    job["status"] = "cancelled"
+    _persist_job(job)
+    return {"status": "cancelled", "job_id": job_id}
 
 
 @app.get("/api/jobs/{job_id}")
@@ -344,9 +378,14 @@ def _run_job(job_id: str) -> None:
     req = FixJobRequest(**job["request"])
     job["status"] = "running"
     job["started_at"] = datetime.now(timezone.utc).isoformat()
+    _persist_job(job)
 
     def log(msg: str):
         job["log"].append({"ts": datetime.now(timezone.utc).isoformat(), "msg": msg})
+        _persist_job(job)
+
+    def _check_cancelled() -> bool:
+        return job_id in _cancelled_jobs
 
     try:
         # Re-sync connections → env vars → reset settings singleton
@@ -375,9 +414,14 @@ def _run_job(job_id: str) -> None:
         log(f"Found {len(issues)} issues")
         job["total_issues"] = len(issues)
 
+        if _check_cancelled():
+            log("Job cancelled.")
+            return
+
         if not issues:
             job["status"] = "completed"
             job["result"] = {"fixed": 0, "skipped": 0, "total": 0}
+            _persist_job(job)
             return
 
         # Clone / open repo
@@ -461,7 +505,12 @@ def _run_job(job_id: str) -> None:
                 "instructions": instructions_contents,
             }
             job["repo_dir"] = str(repo_dir)
+            _persist_job(job)
             sq.close()
+            return
+
+        if _check_cancelled():
+            log("Job cancelled before applying fixes.")
             return
 
         # Apply fixes using LLM-based fixer
@@ -522,6 +571,7 @@ def _run_job(job_id: str) -> None:
                 ],
             }
             job["repo_dir"] = str(repo_dir)
+            _persist_job(job)
             sq.close()
             return
 
@@ -576,6 +626,7 @@ def _run_job(job_id: str) -> None:
         job["result"] = result_dict
         job["repo_dir"] = str(repo_dir)
         log("Done!")
+        _persist_job(job)
 
         sq.close()
 
@@ -583,6 +634,7 @@ def _run_job(job_id: str) -> None:
         log(f"ERROR: {e}")
         job["status"] = "failed"
         job["error"] = str(e)[:500]
+        _persist_job(job)
 
 
 # ---------------------------------------------------------------------------
@@ -605,7 +657,7 @@ def apply_fixes(job_id: str):
     new_id = str(uuid.uuid4())[:8]
     new_req = dict(orig["request"])
     new_req["dry_run"] = False
-    _jobs[new_id] = {
+    new_job: Dict[str, Any] = {
         "id": new_id,
         "status": "queued",
         "request": new_req,
@@ -614,6 +666,7 @@ def apply_fixes(job_id: str):
         "result": None,
         "parent_job": job_id,
     }
+    _persist_job(new_job)
     t = threading.Thread(target=_run_job, args=(new_id,), daemon=True)
     t.start()
     return {"job_id": new_id, "parent_job": job_id}
@@ -658,6 +711,7 @@ def push_and_create_pr(job_id: str):
                 api_host, api_org, api_repo = m.group(1), m.group(2), m.group(3)
                 base_branch = req_data.get("branch") or "staging"
                 import httpx
+                from sonarfix.config import get_settings
                 pr_resp = httpx.post(
                     f"https://{api_host}/api/v3/repos/{api_org}/{api_repo}/pulls",
                     headers={"Authorization": f"token {git_token}", "Accept": "application/json"},
@@ -667,7 +721,7 @@ def push_and_create_pr(job_id: str):
                         "base": base_branch,
                         "body": f"Automated fixes from SonarFix Agent.\n\nJob: `{job_id}`\nBranch: `{fix_branch}`",
                     },
-                    verify=False,
+                    verify=get_settings().ssl_verify,
                     timeout=30.0,
                 )
                 if pr_resp.status_code in (200, 201):
