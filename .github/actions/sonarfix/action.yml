@@ -1,0 +1,65 @@
+name: 'SonarFix Auto-Repair'
+description: 'Automatically fix SonarQube issues in your PR using LLM'
+
+inputs:
+  sonarqube-url:
+    description: 'SonarQube server URL (e.g. https://sonarqube.example.com)'
+    required: true
+  sonarqube-token:
+    description: 'SonarQube authentication token'
+    required: true
+  llm-api-url:
+    description: 'Base URL for the LLM API'
+    required: true
+    default: 'https://api.openai.com/v1'
+  llm-api-key:
+    description: 'API key for the LLM provider'
+    required: true
+  llm-model:
+    description: 'LLM model to use for generating fixes'
+    default: 'gpt-4o-mini'
+  severity-filter:
+    description: 'Only fix issues with these severities (comma-separated)'
+    default: 'CRITICAL,MAJOR'
+  create-pr:
+    description: 'Create a PR with fixes instead of pushing directly'
+    default: 'true'
+  branch:
+    description: 'Branch to analyse and fix'
+    default: '${{ github.head_ref }}'
+
+outputs:
+  fixed-count:
+    description: 'Number of issues fixed'
+    value: ${{ steps.sonarfix.outputs.fixed-count }}
+  pr-url:
+    description: 'URL of the created PR (if create-pr is true)'
+    value: ${{ steps.sonarfix.outputs.pr-url }}
+
+runs:
+  using: 'composite'
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install SonarFix
+      shell: bash
+      run: pip install sonarfix-agent
+
+    - name: Run SonarFix
+      id: sonarfix
+      shell: bash
+      env:
+        SONARFIX_SONAR_URL: ${{ inputs.sonarqube-url }}
+        SONARFIX_SONAR_TOKEN: ${{ inputs.sonarqube-token }}
+        SONARFIX_LLM_API_URL: ${{ inputs.llm-api-url }}
+        SONARFIX_LLM_API_KEY: ${{ inputs.llm-api-key }}
+        SONARFIX_LLM_MODEL: ${{ inputs.llm-model }}
+      run: |
+        sonarfix run \
+          --sonar-url "${{ inputs.sonarqube-url }}" \
+          --sonar-token "${{ inputs.sonarqube-token }}" \
+          --severity "${{ inputs.severity-filter }}" \
+          --branch "${{ inputs.branch }}" \
+          --output-format github-actions

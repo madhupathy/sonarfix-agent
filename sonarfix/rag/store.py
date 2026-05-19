@@ -17,7 +17,39 @@ from typing import Dict, List, Optional, Tuple
 
 
 DB_PATH = Path.home() / ".sonarfix" / "rag.db"
-EMBEDDING_DIM = 64  # dimension for pseudo-embeddings
+EMBEDDING_DIM = 64  # dimension for pseudo-embeddings (fallback only)
+
+
+class EmbeddingModel:
+    """Wraps sentence-transformers for real semantic embeddings with trigram fallback."""
+
+    def __init__(self) -> None:
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+            self._model = SentenceTransformer("all-MiniLM-L6-v2")  # small, fast
+            self._available = True
+        except ImportError:
+            self._available = False
+
+    @property
+    def available(self) -> bool:
+        return self._available
+
+    def encode(self, text: str) -> List[float]:
+        if self._available:
+            return self._model.encode(text).tolist()
+        return _pseudo_embed(text)  # fallback to trigram hashing
+
+
+# Module-level singleton so the model is only loaded once per process
+_embedding_model: Optional[EmbeddingModel] = None
+
+
+def _get_embedding_model() -> EmbeddingModel:
+    global _embedding_model
+    if _embedding_model is None:
+        _embedding_model = EmbeddingModel()
+    return _embedding_model
 
 
 @dataclass
@@ -159,7 +191,7 @@ class RAGStore:
         """Store a successful fix example for future retrieval."""
         # Build embedding from the combination of rule + message + code
         embed_text = f"{rule_key} {issue_message} {before_snippet[:500]}"
-        embedding = _pseudo_embed(embed_text)
+        embedding = _get_embedding_model().encode(embed_text)
 
         try:
             cur = self.conn.execute(
@@ -217,7 +249,7 @@ class RAGStore:
         seen_ids = {r.id for r in results}
 
         query_text = f"{rule_key} {issue_message}"
-        query_embedding = _pseudo_embed(query_text)
+        query_embedding = _get_embedding_model().encode(query_text)
 
         # Filter by language if provided
         if language:
@@ -269,7 +301,7 @@ class RAGStore:
     ) -> int:
         """Store a coding standard document chunk."""
         embed_text = f"{title} {content[:500]}"
-        embedding = _pseudo_embed(embed_text)
+        embedding = _get_embedding_model().encode(embed_text)
 
         try:
             cur = self.conn.execute(
@@ -292,7 +324,7 @@ class RAGStore:
         min_score: float = 0.2,
     ) -> List[StandardDoc]:
         """Retrieve relevant coding standard documents."""
-        query_embedding = _pseudo_embed(query)
+        query_embedding = _get_embedding_model().encode(query)
 
         if language:
             rows = self.conn.execute(

@@ -1,0 +1,74 @@
+# Example workflow: run SonarFix automatically on every pull request.
+#
+# Required repository secrets:
+#   SONARQUBE_URL    — your SonarQube server URL
+#   SONARQUBE_TOKEN  — a SonarQube user token with "Browse" + "Execute Analysis" permissions
+#   LLM_API_KEY      — API key for your chosen LLM provider (OpenAI, Azure, etc.)
+#
+# Optional repository variables:
+#   LLM_API_URL      — override if using Azure OpenAI or another compatible endpoint
+#   LLM_MODEL        — model name (default: gpt-4o-mini)
+
+name: SonarFix Auto-Repair
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write       # needed to commit fixed files
+  pull-requests: write  # needed to post a comment with the fix summary
+
+jobs:
+  sonarfix:
+    name: Auto-fix SonarQube issues
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0   # full history helps SonarQube incremental analysis
+
+      # ------------------------------------------------------------------
+      # Run SonarFix
+      # ------------------------------------------------------------------
+      - name: Run SonarFix
+        id: sonarfix
+        uses: ./.github/actions/sonarfix
+        with:
+          sonarqube-url: ${{ secrets.SONARQUBE_URL }}
+          sonarqube-token: ${{ secrets.SONARQUBE_TOKEN }}
+          llm-api-url: ${{ vars.LLM_API_URL || 'https://api.openai.com/v1' }}
+          llm-api-key: ${{ secrets.LLM_API_KEY }}
+          llm-model: ${{ vars.LLM_MODEL || 'gpt-4o-mini' }}
+          severity-filter: 'CRITICAL,MAJOR'
+          create-pr: 'false'   # push fixes directly to the PR branch
+          branch: ${{ github.head_ref }}
+
+      # ------------------------------------------------------------------
+      # Post a summary comment on the PR
+      # ------------------------------------------------------------------
+      - name: Comment with fix summary
+        if: steps.sonarfix.outputs.fixed-count != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fixedCount = '${{ steps.sonarfix.outputs.fixed-count }}';
+            const prUrl = '${{ steps.sonarfix.outputs.pr-url }}';
+            const body = [
+              `### SonarFix Auto-Repair`,
+              ``,
+              `Fixed **${fixedCount}** SonarQube issue(s) on this PR branch.`,
+              prUrl ? `\nFix PR: ${prUrl}` : '',
+              ``,
+              `> _Powered by [SonarFix Agent](https://github.com/chmad/sonarfix-agent)_`,
+            ].join('\n');
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });

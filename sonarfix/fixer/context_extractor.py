@@ -16,12 +16,13 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 
-# Approximate tokens-per-char ratio (conservative for code)
-CHARS_PER_TOKEN = 3.5
+# Approximate chars-per-token ratio used only when tiktoken is unavailable.
+# 4 chars/token is a slightly better estimate than the old 3.5 for code.
+_CHARS_PER_TOKEN_FALLBACK = 4
 # Leave room for system prompt, issue descriptions, and LLM output
 # 32768 total - ~4096 output - ~3000 prompt/issues = ~20000 for code context
 MAX_CONTEXT_TOKENS = 20000
-MAX_CONTEXT_CHARS = int(MAX_CONTEXT_TOKENS * CHARS_PER_TOKEN)
+MAX_CONTEXT_CHARS = int(MAX_CONTEXT_TOKENS * _CHARS_PER_TOKEN_FALLBACK)
 # How many lines of imports/header to always include
 HEADER_LINES = 30
 # Lines of padding around extracted regions
@@ -63,9 +64,19 @@ class ExtractedContext:
         return "\n\n".join(parts)
 
 
+def _count_tokens(text: str) -> int:
+    """Count tokens using tiktoken when available, with a fallback estimate."""
+    try:
+        import tiktoken  # type: ignore
+        enc = tiktoken.get_encoding("cl100k_base")  # works for GPT-4, Claude, etc.
+        return len(enc.encode(text))
+    except ImportError:
+        return len(text) // _CHARS_PER_TOKEN_FALLBACK
+
+
 def estimate_tokens(text: str) -> int:
-    """Rough token count estimate."""
-    return int(len(text) / CHARS_PER_TOKEN)
+    """Public alias for token counting (kept for backwards compatibility)."""
+    return _count_tokens(text)
 
 
 def _find_block_boundaries(

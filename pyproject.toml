@@ -30,6 +30,16 @@ dev = [
     "pytest-asyncio>=0.23",
     "respx>=0.21",
 ]
+embeddings = [
+    "sentence-transformers>=2.7.0",
+]
+tokens = [
+    "tiktoken>=0.7.0",
+]
+all = [
+    "sentence-transformers>=2.7.0",
+    "tiktoken>=0.7.0",
+]
 
 [project.scripts]
 sonarfix = "sonarfix.cli:app"
