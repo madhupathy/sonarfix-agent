@@ -1,369 +1,264 @@
 # SonarFix Agent
 
-Auto-fix SonarQube issues using an LLM (via vLLM or any OpenAI-compatible API).
-Includes a **web GUI** and a **CLI** — use whichever fits your workflow.
+![Python](https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Tests](https://img.shields.io/badge/tests-93%20passing-brightgreen)
 
-> Paste a PR URL, preview issues from SonarQube, review fixes,
-> then apply them and create a new PR — all from the browser.
+**SonarQube finds the bugs. SonarFix fixes them.**
+
+Point SonarFix at any branch or pull request, and it automatically repairs SonarQube issues using an LLM — then commits, pushes, and optionally opens a PR with the fixes.
+
+---
+
+## Why SonarFix?
+
+SonarQube surfaces thousands of issues but leaves fixing them entirely to developers.
+SonarFix closes that loop: it reads each SonarQube issue in context, sends the file + issue + RAG-retrieved past fixes to an LLM, validates the result with a language-specific syntax check, and commits only clean code.
+
+---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  Web GUI (Next.js :3000)  ──or──  CLI (sonarfix)                            │
-└────────────────────────────┬─────────────────────────────────────────────────┘
-                             │  /api/*
-                ┌────────────▼────────────┐
-                │  FastAPI Backend (:8000) │
-                └────────────┬────────────┘
-                             │
-┌─────────────┐      ┌──────▼───────┐      ┌──────────────────┐
-│  Settings /  │─────▶│  SonarQube   │─────▶│   Fix Planner    │
-│  Connections │      │  Fetcher     │      │  (group & rank)  │
-└─────────────┘      └──────────────┘      └────────┬─────────┘
-                                                     │
-                                           ┌─────────▼──────────┐
-                                           │     Fix Graph       │
-                                           │  (state machine)    │
-                                           └─────────┬──────────┘
-                                                     │
-         ┌───────────┬──────────┬──────────┬─────────┴────────┐
-         ▼           ▼          ▼          ▼                  ▼
-   ┌──────────┐ ┌────────┐ ┌────────┐ ┌────────┐      ┌──────────┐
-   │ Context  │ │  RAG   │ │  LLM   │ │Syntax  │      │  RAG     │
-   │ Extractor│ │Retrieve│ │ Fixer  │ │Validate│      │  Store   │
-   │ (chunk)  │ │(past   │ │(vLLM / │ │+ Retry │      │(save fix)│
-   │          │ │ fixes) │ │OpenAI) │ │  loop  │      │          │
-   └──────────┘ └────────┘ └────────┘ └────────┘      └──────────┘
-                                                              │
-       ┌──────────────┐      ┌──────────────────┐            │
-       │  Git Manager │─────▶│  Commit + Push   │◀───────────┘
-       │  (clone/br)  │      │  & Create PR     │
-       └──────────────┘      └──────────────────┘
+SonarQube ──────────────────────────────────────────────────────────────────┐
+  (issues API)                                                                │
+                                                                              │
+          ┌───────────────────────────────────────────────────────────────┐   │
+          │             SonarFix Agent  (FastAPI :8000 / CLI)             │   │
+          └────────┬──────────────────────────────────────────────────────┘   │
+                   │                                                           │
+     ┌─────────────▼─────────────────────────────────────┐                   │
+     │              Fix Graph  (per-file state machine)   │◀──────────────────┘
+     │                                                    │
+     │  extract_context → retrieve_RAG → build_prompt    │
+     │       → call_LLM → apply_fix → validate → store  │
+     │              (retry up to 3× on failure)          │
+     └──────┬───────────────────┬───────────────────────┘
+            │                   │
+        ┌───▼────┐         ┌────▼──────────────┐
+        │  LLM   │         │  RAG Store         │
+        │ (vLLM/ │         │  ~/.sonarfix/      │
+        │ OpenAI)│         │  rag.db            │
+        └───┬────┘         └───────────────────┘
+            │
+     ┌──────▼────────────┐      ┌─────────────────┐
+     │  Git Manager       │─────▶│  Commit + Push  │
+     │  (clone / branch) │      │  & Create PR    │
+     └───────────────────┘      └─────────────────┘
 ```
 
-### Fix Graph Pipeline (per file)
-
-Each file goes through a **state-machine pipeline** with automatic retry:
-
-```
-EXTRACT_CONTEXT → RETRIEVE_RAG → BUILD_PROMPT → CALL_LLM → APPLY_FIX → VALIDATE → STORE_SUCCESS → DONE
-                                      ▲                                     │
-                                      │              RETRY (up to 3x)       │
-                                      └─────────────────────────────────────┘
-                                        (with error feedback in prompt)
-```
-
-- **EXTRACT_CONTEXT** — For small files, sends the full content. For large files (>12K tokens), extracts only the imports/header + the function/class block containing each issue line.
-- **RETRIEVE_RAG** — Queries the RAG store for similar past fixes (exact rule match + cosine similarity) and relevant coding standards.
-- **BUILD_PROMPT** — Constructs the LLM prompt with file context, issue descriptions (including full rule name + description), RAG examples, and retry error feedback (if retrying).
-- **CALL_LLM** — Sends the prompt to the LLM API. Context-window errors are terminal (no retry). Other errors trigger retry.
-- **APPLY_FIX** — For full files, replaces the content. For chunked files, splices fixed regions back into the original using line markers.
-- **VALIDATE** — Runs language-specific syntax checks (`py_compile`, `bash -n`, `go vet`, etc.). On failure, restores original file and retries with the syntax error fed back to the LLM.
-- **STORE_SUCCESS** — Saves the successful fix (before/after snippets per issue) into the RAG store for future retrieval.
-
-**Flow**: Fetch SonarQube issues → Resolve repo (local auto-detect → HTTPS+token clone) → Group by file & severity → Run Fix Graph per file (with chunking, RAG, retry, validation) → Commit to fix branch → Push & Create PR.
-
-## Key Features (v2)
-
-| Feature | Description |
-|---------|-------------|
-| **Smart Context Chunking** | Large files are automatically chunked — only imports + relevant function blocks are sent to the LLM. Fixes the "context window exceeded" crash for files >16K tokens. |
-| **Retry with Feedback** | Up to 3 automatic retries per file. Syntax errors and LLM failures are fed back into the prompt so the LLM can self-correct. |
-| **Post-Fix Validation** | Every fix is syntax-checked immediately. Invalid code is rolled back and retried with the error message. |
-| **Enhanced Prompts** | Full SonarQube rule name + description included. Separate prompt templates for full-file vs chunked mode. |
-| **RAG Store** | SQLite database (`~/.sonarfix/rag.db`) indexes every successful fix. On future runs, similar past fixes are retrieved and included as few-shot examples. |
-| **RAG Standards** | Upload coding standard documents via API. They're retrieved and included in prompts when relevant. |
-| **State Machine** | Each file fix is a graph traversal (not a single LLM call). The pipeline handles errors, retries, and validation deterministically. |
+---
 
 ## Quick Start
 
-### Prerequisites
-
-- **Python 3.9+**
-- **Node.js 18+** (for the web GUI)
-- **LLM endpoint (OpenAI-compatible)** — e.g. vLLM, OpenAI, Azure OpenAI
-- **SonarQube credentials** — token (recommended) or username/password
-- **Git Personal Access Token** — for HTTPS cloning of private repos (not needed if repo is already cloned locally)
-
-### LLM Server Setup
-
-SonarFix works with any **OpenAI-compatible** LLM endpoint. Recommended options:
-
-| Provider | Example Base URL | API Key |
-|----------|------------------|---------|
-| vLLM (self-hosted) | `http://localhost:8000/v1` | `dummy` |
-| OpenAI | `https://api.openai.com/v1` | `sk-...` |
-| Azure OpenAI | `https://<resource>.openai.azure.com/...` | Your Azure key |
-| Ollama | `http://localhost:11434/v1` | `dummy` |
-
-For best results with code fixes, use a code-specialized model like `Qwen/Qwen2.5-Coder-32B-Instruct` (vLLM) or `gpt-4o` (OpenAI).
+**Step 1 — Install**
 
 ```bash
-# Verify your LLM endpoint
-curl http://localhost:8000/v1/models
-
-# Quick test
-curl http://localhost:8000/v1/chat/completions \
-  -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer dummy' \
-  -d '{"model":"Qwen/Qwen2.5-Coder-32B-Instruct","messages":[{"role":"user","content":"Say hi"}],"max_tokens":5}'
+pip install -e ".[dev]"        # from source
+# or
+pip install sonarfix-agent     # from PyPI (when published)
 ```
 
-### Install
+**Step 2 — Start the backend API**
 
 ```bash
-cd ~/sonarfix-agent
-pip install -e ".[dev]"
-```
-
-### Configure
-
-```bash
-cp .env.example .env
-# Edit .env with your credentials
-```
-
-| Variable | Description |
-|----------|-------------|
-| `SONARQUBE_URL` | SonarQube server URL |
-| `SONARQUBE_USERNAME` | Basic auth username **or** API token (for token auth, use token here with empty password) |
-| `SONARQUBE_PASSWORD` | Basic auth password (leave empty for token auth) |
-| `LLM_API_KEY` | LLM API key (`dummy` for vLLM, real key for OpenAI/Azure) |
-| `LLM_MODEL` | Model name (e.g. `Qwen/Qwen2.5-Coder-32B-Instruct`, `gpt-4o`) |
-| `LLM_BASE_URL` | OpenAI-compatible API base URL (default: `http://localhost:8000/v1`) |
-| `WORKSPACE_DIR` | Temp directory for cloned repos |
-
-> **Tip**: The GUI Settings page is the easiest way to configure credentials — no `.env` file needed.
-
-## Running the Web GUI
-
-No deployment needed — everything runs locally.
-
-### 1. Install frontend dependencies (one-time)
-
-```bash
-cd ~/sonarfix-agent/web
-npm install
-```
-
-### 2. Start the backend API
-
-```bash
-cd ~/sonarfix-agent
 uvicorn sonarfix.api:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-### 3. Start the frontend (in a second terminal)
+**Step 3 — Start the web UI**
 
 ```bash
-cd ~/sonarfix-agent/web
-npm run dev
+cd web && npm install && npm run dev
 ```
 
-### 4. Open your browser
+**Step 4 — Configure connections**
 
-Go to **http://localhost:3000** (or `:3001` if 3000 is in use).
+Open **http://localhost:3000/settings** and fill in:
+- SonarQube URL + token
+- LLM API key, model, and base URL (or leave defaults for a local vLLM server)
+- Git Personal Access Token (needed for private repo cloning)
 
-| Page | URL | Description |
-|------|-----|-------------|
-| Dashboard | `/` | Enter project key + repo URL, preview issues, start fix jobs |
-| Settings | `/settings` | Configure connections for SonarQube, LLM, and Git |
+**Step 5 — Fix issues**
 
-### GUI Features
+Go to **http://localhost:3000**, paste a PR or branch URL, enter your SonarQube project key, and click **Fix Issues**.
 
-- **Smart URL Input** — paste any PR/branch/repo web page URL and it auto-extracts the SSH clone URL, PR ID, and branch name
-- **Connectors** — SonarQube (basic auth / token / SSO-SAML), LLM (API key + model + base URL), Git (PAT / basic / SSO-SAML)
-- **Test Connection** — validate credentials before saving
-- **Issue Preview** — fetch and browse SonarQube issues in a sortable table before fixing
-- **Fix Jobs** — launch fixes in background with live log polling
-- **Dry Run** — preview which files and issues will be fixed before committing
-- **Apply Fixes** — LLM reads each file + its SonarQube issues, returns fixed code, writes it directly
-- **Push & Create PR** — after fixes are applied, push the fix branch and auto-create a PR on your Git host (GitHub Enterprise API)
-- **Local Repo Auto-Detect** — if a repo matching the URL exists in `~/`, it's used directly (no clone needed)
-- **HTTPS + Token Clone** — if no local clone found, clones via HTTPS using your Git PAT from Settings
+---
 
-> Credentials are stored locally in `~/.sonarfix/connections.json` and synced to env vars at runtime.
-> RAG data is stored in `~/.sonarfix/rag.db` (SQLite).
+## GitHub Action Usage
 
-### Recommended Workflow
+Add SonarFix to any repository to auto-fix SonarQube issues on every PR:
 
-1. **Settings** → configure SonarQube (token auth), LLM (vLLM defaults pre-filled), and Git (Personal Access Token)
-2. **Dashboard** → paste PR URL (e.g. `https://your-git-host/org/repo/pull/123`)
-3. Enter the **SonarQube Project Key** (find it in the SonarQube dashboard URL, e.g. `my-org::my-project`)
-4. Click **Preview** to see issues
-5. Click **Fix Issues** — the graph pipeline fixes each file with chunking, RAG, retries, and validation
-6. Review the results and diff in the GUI
-7. Click **Push & Create PR** to push and open a PR
+```yaml
+# .github/workflows/sonarfix.yml
+name: SonarFix Auto-Repair
 
-> Each successful fix is automatically stored in the RAG database. Subsequent runs benefit from these past examples.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
 
-### Uploading Coding Standards (optional)
+permissions:
+  contents: write
+  pull-requests: write
 
-You can seed the RAG store with your project's coding standards so the LLM has domain-specific context:
+jobs:
+  sonarfix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 0
+
+      - name: Run SonarFix
+        id: sonarfix
+        uses: ./.github/actions/sonarfix
+        with:
+          sonarqube-url: ${{ secrets.SONARQUBE_URL }}
+          sonarqube-token: ${{ secrets.SONARQUBE_TOKEN }}
+          llm-api-url: ${{ vars.LLM_API_URL || 'https://api.openai.com/v1' }}
+          llm-api-key: ${{ secrets.LLM_API_KEY }}
+          llm-model: ${{ vars.LLM_MODEL || 'gpt-4o-mini' }}
+          severity-filter: 'CRITICAL,MAJOR'
+          create-pr: 'false'
+
+      - name: Comment with fix summary
+        if: steps.sonarfix.outputs.fixed-count != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `### SonarFix fixed **${{ steps.sonarfix.outputs.fixed-count }}** issue(s)`,
+            });
+```
+
+**Required secrets:** `SONARQUBE_URL`, `SONARQUBE_TOKEN`, `LLM_API_KEY`
+
+**Action outputs:**
+| Output | Description |
+|--------|-------------|
+| `fixed-count` | Number of issues fixed |
+| `pr-url` | PR URL (when `create-pr: true`) |
+
+---
+
+## Configuration
+
+All settings can be configured via the web UI Settings page or via environment variables / `.env` file.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SONARQUBE_URL` | SonarQube server URL | *(required)* |
+| `SONARQUBE_USERNAME` | Basic auth username **or** API token | *(required)* |
+| `SONARQUBE_PASSWORD` | Basic auth password (empty for token auth) | `""` |
+| `LLM_API_KEY` | LLM API key (`dummy` for vLLM, real key for OpenAI/Azure) | `dummy` |
+| `LLM_MODEL` | Model name served by your endpoint | `Qwen/Qwen2.5-72B-Instruct-AWQ` |
+| `LLM_BASE_URL` | OpenAI-compatible API base URL | `http://localhost:8000/v1` |
+| `LLM_TIMEOUT` | LLM request timeout in seconds | `600.0` |
+| `SSL_VERIFY` | Set `false` to disable SSL verification (self-signed certs) | `true` |
+| `WORKSPACE_DIR` | Directory for cloned repos | `~/.sonarfix/workspaces` |
+| `GIT_PUSH_REMOTE` | Git remote name for pushing fix branches | `origin` |
+| `GIT_USER_NAME` | Git commit author name | *(system git config)* |
+| `GIT_USER_EMAIL` | Git commit author email | *(system git config)* |
+
+> **Tip:** The Settings page is the easiest way to configure — no `.env` file needed.
+> Credentials are stored in `~/.sonarfix/connections.json`.
+
+---
+
+## Supported Languages
+
+SonarFix has built-in syntax validators for these languages. The LLM can fix any language that your model understands.
+
+| Language | Extension | Syntax Validator | Notes |
+|----------|-----------|-----------------|-------|
+| Python | `.py` | `python -m py_compile` | Full support |
+| Go | `.go` | `go vet` | Full support |
+| JavaScript | `.js` | `node --check` | Full support |
+| TypeScript | `.ts` | `node --check` | Full support |
+| Java | `.java` | `javac` | Full support |
+| Shell | `.sh` / `.bash` | `bash -n` | Full support |
+| Ruby | `.rb` | `ruby -c` | Full support |
+| PHP | `.php` | `php -l` | Full support |
+| C# | `.cs` | *(LLM-only)* | No local validator |
+| Other | * | *(LLM-only)* | Kotlin, Swift, Rust, Scala, C/C++, … |
+
+For languages without a built-in validator, fixes are still applied — they just skip the local syntax check step. The LLM's output quality is the safety net.
+
+---
+
+## How RAG Works
+
+Every time SonarFix successfully fixes an issue, it stores the before/after code snippet in a local SQLite database (`~/.sonarfix/rag.db`) along with a semantic embedding of the issue description.
+
+On the next run, before calling the LLM, SonarFix:
+1. **Searches by rule key** — retrieves exact past fixes for the same SonarQube rule.
+2. **Searches by embedding similarity** — uses cosine similarity on sentence-transformer embeddings (`all-MiniLM-L6-v2`) to find semantically similar fixes even across different rules.
+3. **Injects examples** into the LLM prompt as few-shot demonstrations.
+
+This means SonarFix gets *better over time* — each successful fix makes the next run faster and more accurate for similar issues.
+
+You can also seed the RAG store with your project's coding standards:
 
 ```bash
 curl -X POST http://localhost:8000/api/rag/standards \
   -H 'Content-Type: application/json' \
   -d '{
-    "source": "project-standards",
-    "title": "Error handling policy",
-    "content": "All functions must return errors, not panic. Use fmt.Errorf with %w for wrapping.",
+    "source": "our-standards",
+    "title": "Error handling in Go",
+    "content": "All functions must return errors using fmt.Errorf with %w wrapping.",
     "language": "go"
   }'
 ```
 
-Check RAG store stats:
+**Embedding model:** Uses `sentence-transformers/all-MiniLM-L6-v2` (384-dim) if the optional `sentence-transformers` package is installed; falls back to trigram-hash pseudo-embeddings otherwise.
 
 ```bash
-curl http://localhost:8000/api/rag/stats
-# {"fix_examples": 42, "standard_docs": 5}
+# Install for real semantic search
+pip install "sonarfix-agent[embeddings]"
 ```
 
 ---
 
 ## CLI Usage
 
-### List issues (dry run)
-
 ```bash
+# List issues for a project/branch
 sonarfix issues my-project --branch main
 sonarfix issues my-project --pr 42 --severity BLOCKER,CRITICAL
-```
 
-### Full auto-fix pipeline
-
-```bash
-# Fix issues on a branch
+# Full auto-fix pipeline
 sonarfix run my-project --repo git@github.com:org/repo.git --branch develop
-
-# Fix issues on a PR
 sonarfix run my-project --repo git@github.com:org/repo.git --pr 42
 
-# With filters
+# Filter by severity and issue type
 sonarfix run my-project --repo git@github.com:org/repo.git \
   --branch main \
   --severity BLOCKER,CRITICAL,MAJOR \
   --type BUG,VULNERABILITY \
   --max 30
 
-# Dry run (generate instructions only)
+# Dry run — generate fix instructions only
 sonarfix run my-project --repo git@github.com:org/repo.git --branch main --dry-run
 
-# Use existing local repo
+# Use an existing local clone (skip cloning)
 sonarfix run my-project --repo git@github.com:org/repo.git --branch main --local /path/to/repo
 
-# Auto-push fix branch
+# Auto-push fix branch after fixing
 sonarfix run my-project --repo git@github.com:org/repo.git --branch main --auto-push
 ```
-
-### Validate a workspace
-
-```bash
-sonarfix validate /tmp/sonarfix-workspaces/my-repo
-```
-
-### List branches and PRs
-
-```bash
-sonarfix branches my-project
-sonarfix prs my-project
-```
-
-## Commands
 
 | Command | Description |
 |---------|-------------|
 | `sonarfix issues` | List SonarQube issues for a project/branch/PR |
-| `sonarfix run` | Full pipeline: fetch → clone → plan → fix (with graph) → validate → report |
-| `sonarfix validate` | Run syntax checks on modified files |
+| `sonarfix run` | Full pipeline: fetch → clone → plan → fix → validate → commit |
+| `sonarfix validate` | Run syntax checks on modified files in a workspace |
 | `sonarfix branches` | List branches for a SonarQube project |
 | `sonarfix prs` | List pull requests for a SonarQube project |
 
-## How It Works
-
-1. **Fetch** — Pulls open issues from SonarQube API (`/api/issues/search`) with pagination, filtered by severity/type
-2. **Resolve Repo** — Auto-detects local clones in `~/` or `WORKSPACE_DIR`, falls back to HTTPS+token clone
-3. **Plan** — Groups issues by file, ranks by severity, enriches with rule descriptions from `/api/rules/show`
-4. **Fix (Graph Pipeline)** — For each file, runs the Fix Graph state machine:
-   - **Extract Context** — Small files sent in full; large files chunked to imports + relevant blocks
-   - **Retrieve RAG** — Fetches similar past fixes (exact rule match, then cosine similarity) and coding standards
-   - **Build Prompt** — Assembles system + user prompt with context, issues, RAG examples, and retry feedback
-   - **Call LLM** — Sends to vLLM/OpenAI API (`/v1/chat/completions`), receives fixed code
-   - **Apply Fix** — Writes fixed content (full replacement or region splice for chunked files)
-   - **Validate** — Syntax check; on failure, rolls back and retries with error feedback (up to 3x)
-   - **Store Success** — Saves fix to RAG store for future runs
-5. **Report** — Generates `fix-report.json` and `fix-report.md` with fix summary, diff stats, and batch details
-6. **Commit** — Creates a `sonarfix/<branch>-<timestamp>` branch with all fixes
-7. **Push & PR** — (GUI) Pushes fix branch and creates a PR via GitHub Enterprise API
-
-## Project Structure
-
-```
-sonarfix/
-├── cli.py                      # Typer CLI
-├── api.py                      # FastAPI backend (bridges GUI ↔ CLI, RAG endpoints)
-├── config.py                   # Pydantic settings (.env)
-├── sonarqube/
-│   ├── client.py               # SonarQube API client (httpx, basic auth)
-│   ├── models.py               # Pydantic models (Issue, Rule, Component)
-│   └── filters.py              # Group/rank/deduplicate issues
-├── git/
-│   └── manager.py              # GitPython wrapper
-├── fixer/
-│   ├── llm_fixer.py            # LLM fixer — delegates to FixGraph pipeline
-│   ├── graph.py                # Fix Graph state machine (extract → RAG → LLM → validate → retry)
-│   ├── context_extractor.py    # Smart chunking (imports + function blocks for large files)
-│   ├── prompt.py               # Prompt templates (legacy, used by planner)
-│   └── planner.py              # Batch orchestrator
-├── rag/
-│   ├── __init__.py
-│   └── store.py                # SQLite-backed RAG store (fix examples + coding standards)
-├── validator/
-│   └── checker.py              # Syntax checks + diff summary
-└── reporting/
-    └── report.py               # JSON + Markdown reports
-
-web/                            # Next.js frontend
-├── app/
-│   ├── layout.tsx              # Root layout + Toaster
-│   ├── page.tsx                # Dashboard (issue preview, fix jobs)
-│   ├── settings/page.tsx       # Connectors (SonarQube, LLM, Git)
-│   └── globals.css             # Tailwind + gradient/blob animations
-├── components/ui/              # shadcn/ui primitives
-├── lib/utils.ts                # cn() helper
-├── tailwind.config.ts
-├── next.config.mjs             # API proxy rewrite to :8000
-└── package.json
-
-tests/                          # 93 tests
-├── test_filters.py             # Issue filter/sort/group tests
-├── test_models.py              # Pydantic model parsing tests
-├── test_llm_fixer.py           # LLMFixer init + strip code fences
-├── test_planner.py             # Prompt building + file context reading
-├── test_context_extractor.py   # Smart chunking, block detection, apply chunked fix
-├── test_graph.py               # FixGraph state machine (success, retry, failure, context errors)
-├── test_rag_store.py           # RAG store CRUD, embeddings, similarity search
-├── test_report.py              # Report generation
-└── test_windsurf.py            # Legacy WindsurfResult
-```
-
-## Tech Stack
-
-| Component | Technology |
-|-----------|----------|
-| Language | Python 3.9+ |
-| CLI | Typer + Rich |
-| Config | pydantic-settings |
-| HTTP | httpx |
-| Git | GitPython |
-| Code Fixer | LLM via OpenAI-compatible API (default: vLLM + Qwen2.5-Coder-32B) |
-| Fix Pipeline | Graph-based state machine with retry + validation |
-| RAG Store | SQLite (`~/.sonarfix/rag.db`) with pseudo-embeddings + cosine similarity |
-| Backend API | FastAPI + Uvicorn |
-| Frontend | Next.js 14, React 18, Tailwind CSS 3, shadcn/ui |
-| Icons | Lucide React |
-| Notifications | Sonner (toast) |
+---
 
 ## API Endpoints
 
@@ -373,20 +268,115 @@ tests/                          # 93 tests
 | `GET` | `/api/connections` | List connector status |
 | `POST` | `/api/connections/{connector}` | Save credentials |
 | `DELETE` | `/api/connections/{connector}` | Disconnect |
-| `POST` | `/api/connections/{connector}/test` | Test credentials |
+| `POST` | `/api/connections/{connector}/test` | Test credentials without saving |
 | `GET` | `/api/issues` | Preview SonarQube issues |
-| `POST` | `/api/jobs` | Start a fix job |
-| `GET` | `/api/jobs` | List all jobs |
-| `GET` | `/api/jobs/{id}` | Get job status + logs |
-| `POST` | `/api/jobs/{id}/apply` | Re-run a dry-run job as actual fix |
+| `POST` | `/api/jobs` | Start a fix job (background thread) |
+| `GET` | `/api/jobs?limit=20&offset=0` | List jobs (paginated, newest first) |
+| `GET` | `/api/jobs/{id}` | Get job status + full log |
+| `DELETE` | `/api/jobs/{id}` | Cancel a running/queued job |
+| `POST` | `/api/jobs/{id}/apply` | Re-run a dry-run job as an actual fix |
 | `POST` | `/api/jobs/{id}/push` | Push fix branch + create PR |
-| `GET` | `/api/rag/stats` | RAG store statistics (fix example + standard doc counts) |
-| `POST` | `/api/rag/standards` | Upload a coding standard document for RAG |
-| `GET` | `/api/rag/fixes` | List stored fix examples (optionally filter by `rule_key`) |
+| `GET` | `/api/rag/stats` | RAG store counts (fix examples + standard docs) |
+| `POST` | `/api/rag/standards` | Upload a coding standard document |
+| `GET` | `/api/rag/fixes` | List stored fix examples |
+
+---
+
+## Project Structure
+
+```
+sonarfix/
+├── api.py                       FastAPI backend (GUI ↔ CLI bridge, job persistence, RAG endpoints)
+├── cli.py                       Typer CLI
+├── config.py                    Pydantic settings (.env / environment)
+├── db.py                        SQLite-backed job persistence (~/.sonarfix/jobs.db)
+├── fixer/
+│   ├── llm_fixer.py             LLM fixer — delegates to FixGraph pipeline
+│   ├── graph.py                 Fix Graph state machine (extract → RAG → LLM → validate → retry)
+│   ├── context_extractor.py     Smart chunking (imports + function blocks for large files)
+│   ├── prompt.py                Prompt templates
+│   └── planner.py               Batch orchestrator
+├── sonarqube/
+│   ├── client.py                SonarQube API client (httpx)
+│   ├── models.py                Pydantic models (Issue, Rule, Component)
+│   └── filters.py               Group / rank / deduplicate issues
+├── git/
+│   └── manager.py               GitPython wrapper (clone, branch, commit, push)
+├── rag/
+│   └── store.py                 SQLite RAG store with sentence-transformer embeddings
+├── validator/
+│   └── checker.py               Language-specific syntax checks + diff summary
+└── reporting/
+    └── report.py                JSON + Markdown fix reports
+
+web/
+├── app/
+│   ├── page.tsx                 Dashboard (issue preview, fix jobs, language badges)
+│   ├── settings/page.tsx        Connections + statistics panel
+│   ├── history/page.tsx         Fix history (filterable, sortable, expandable, paginated)
+│   └── globals.css
+├── components/
+│   ├── language-badges.tsx      Supported language badges with tooltip
+│   └── ui/                      shadcn/ui primitives
+├── lib/utils.ts
+└── next.config.mjs              API proxy rewrite → :8000
+
+.github/
+├── actions/sonarfix/action.yml  Composite action for CI/CD integration
+└── workflows/sonarfix-example.yml
+
+tests/                           93 tests across 9 files
+```
+
+---
 
 ## Running Tests
 
 ```bash
 pytest -v
-# 93 tests across 9 test files
+# 93 tests across: filters, models, llm_fixer, planner, context_extractor,
+#                  graph, rag_store, report, windsurf
 ```
+
+---
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|------------|
+| Language | Python 3.9+ |
+| CLI | Typer + Rich |
+| Config | pydantic-settings |
+| HTTP | httpx |
+| Git | GitPython |
+| Code fixer | LLM via OpenAI-compatible API |
+| Fix pipeline | Graph-based state machine with retry + validation |
+| RAG store | SQLite + sentence-transformers (`all-MiniLM-L6-v2`) |
+| Job persistence | SQLite (`~/.sonarfix/jobs.db`) |
+| Backend API | FastAPI + Uvicorn |
+| Frontend | Next.js 14, React 18, Tailwind CSS 3, shadcn/ui |
+| Icons | Lucide React |
+| Notifications | Sonner |
+
+---
+
+## Contributing
+
+1. Fork the repo and create a feature branch.
+2. Install dev dependencies: `pip install -e ".[dev,all]"`
+3. Make your changes. Add tests in `tests/`.
+4. Run `pytest -v` and make sure all tests pass.
+5. Open a pull request with a clear description of what you changed and why.
+
+**Areas that welcome contributions:**
+- Additional language validators (Kotlin, Swift, Rust, C/C++)
+- Alternative LLM providers (Anthropic Claude, Google Gemini)
+- UI improvements to the web dashboard
+- Improved prompt templates for specific SonarQube rule families
+- Performance improvements to the RAG similarity search
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE) for details.

@@ -13,9 +13,10 @@ import { Progress } from "@/components/ui/progress"
 import {
   Bug, GitBranch, GitPullRequest, Play, Settings, Zap, Shield,
   AlertTriangle, Info, CheckCircle2, XCircle, Loader2, FileCode,
-  Send, ExternalLink, FileText, ChevronDown, ChevronUp,
+  Send, ExternalLink, FileText, ChevronDown, ChevronUp, History,
 } from "lucide-react"
 import { toast } from "sonner"
+import { LanguageBadges } from "@/components/language-badges"
 
 interface Issue {
   key: string; rule: string; severity: string; type: string
@@ -192,6 +193,12 @@ export default function DashboardPage() {
             <nav className="flex items-center gap-1">
               <Button variant="ghost" size="sm" className="font-semibold text-foreground">Dashboard</Button>
               <Button variant="ghost" size="sm" asChild>
+                <Link href="/history">
+                  <History className="mr-2 h-4 w-4" />
+                  History
+                </Link>
+              </Button>
+              <Button variant="ghost" size="sm" asChild>
                 <Link href="/settings">
                   <Settings className="mr-2 h-4 w-4" />
                   Settings
@@ -217,6 +224,10 @@ export default function DashboardPage() {
           <p className="mt-2 text-muted-foreground">
             Point to any repo branch or PR, preview issues, and auto-fix them with LLM-powered code generation.
           </p>
+          <div className="mt-3 flex items-center gap-2">
+            <span className="text-xs text-muted-foreground shrink-0">Supported languages:</span>
+            <LanguageBadges />
+          </div>
         </div>
 
         <div className="relative grid gap-8 lg:grid-cols-3">

@@ -13,6 +13,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import {
   Zap, CheckCircle2, XCircle, Shield, GitBranch, Brain,
   ArrowLeft, Loader2, Unplug, FlaskConical, KeyRound, Globe,
+  Database, BarChart3, History, Activity,
 } from "lucide-react"
 import { toast } from "sonner"
 
@@ -22,6 +23,20 @@ interface ConnectorState {
   status: string
   auth_type: string | null
   url?: string
+  llm_model?: string
+  llm_base_url?: string
+}
+
+interface RAGStats {
+  fix_examples: number
+  standard_docs: number
+  error?: string
+}
+
+interface JobStats {
+  total: number
+  completed: number
+  failed: number
 }
 
 const CONNECTOR_META: Record<string, { icon: any; color: string; emoji: string }> = {
@@ -30,9 +45,38 @@ const CONNECTOR_META: Record<string, { icon: any; color: string; emoji: string }
   git: { icon: GitBranch, color: "bg-emerald-500/10 text-emerald-600", emoji: "🔀" },
 }
 
+function StatusDot({ status }: { status: string }) {
+  if (status === "connected") {
+    return (
+      <span
+        className="inline-block h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-emerald-500/20 animate-pulse"
+        title="Connected"
+      />
+    )
+  }
+  if (status === "error" || status === "failing") {
+    return (
+      <span
+        className="inline-block h-2.5 w-2.5 rounded-full bg-red-500 ring-2 ring-red-500/20"
+        title="Configured but failing"
+      />
+    )
+  }
+  return (
+    <span
+      className="inline-block h-2.5 w-2.5 rounded-full bg-gray-300 ring-2 ring-gray-300/20"
+      title="Not configured"
+    />
+  )
+}
+
 export default function SettingsPage() {
   const [connectors, setConnectors] = useState<Record<string, ConnectorState>>({})
   const [loading, setLoading] = useState(true)
+  const [ragStats, setRagStats] = useState<RAGStats | null>(null)
+  const [jobStats, setJobStats] = useState<JobStats | null>(null)
+  const [testingConnectors, setTestingConnectors] = useState<Record<string, boolean>>({})
+  const [testResults, setTestResults] = useState<Record<string, { success: boolean; message: string } | null>>({})
 
   const fetchConnectors = async () => {
     try {
@@ -46,7 +90,71 @@ export default function SettingsPage() {
     }
   }
 
-  useEffect(() => { fetchConnectors() }, [])
+  const fetchStats = async () => {
+    try {
+      const [ragR, jobsR] = await Promise.all([
+        fetch("/api/rag/stats"),
+        fetch("/api/jobs?limit=1&offset=0"),
+      ])
+      if (ragR.ok) setRagStats(await ragR.json())
+      if (jobsR.ok) {
+        const jobsData = await jobsR.json()
+        // Fetch all jobs to compute stats (up to 500 for stat purposes)
+        const allJobsR = await fetch("/api/jobs?limit=500&offset=0")
+        if (allJobsR.ok) {
+          const allJobs = await allJobsR.json()
+          const jobs: any[] = allJobs.jobs || []
+          setJobStats({
+            total: allJobs.total ?? jobs.length,
+            completed: jobs.filter((j: any) => j.status === "completed").length,
+            failed: jobs.filter((j: any) => j.status === "failed").length,
+          })
+        }
+      }
+    } catch {
+      // Stats are optional — don't show error
+    }
+  }
+
+  const quickTestConnector = async (key: string) => {
+    const conn = connectors[key]
+    if (!conn || conn.status !== "connected") return
+    setTestingConnectors(prev => ({ ...prev, [key]: true }))
+    setTestResults(prev => ({ ...prev, [key]: null }))
+    try {
+      const savedR = await fetch("/api/connections")
+      const savedData = await savedR.json()
+      const savedConn = savedData.connections?.[key] ?? {}
+
+      // Build config from saved connection
+      const config: Record<string, string> = {
+        auth_type: savedConn.auth_type || "token",
+        ...(savedConn.url ? { url: savedConn.url } : {}),
+      }
+
+      const r = await fetch(`/api/connections/${key}/test`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ connector: key, config }),
+      })
+      const result = await r.json()
+      setTestResults(prev => ({ ...prev, [key]: result }))
+      if (result.success) toast.success(`${conn.name}: ${result.message}`)
+      else toast.error(`${conn.name}: ${result.message}`)
+    } catch (e: any) {
+      toast.error(`Test failed: ${e.message}`)
+    } finally {
+      setTestingConnectors(prev => ({ ...prev, [key]: false }))
+    }
+  }
+
+  useEffect(() => {
+    fetchConnectors()
+    fetchStats()
+  }, [])
+
+  const totalFixed = jobStats?.completed ?? 0
+  const totalIssuesScanned = "—"
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-background via-background to-primary/5">
@@ -62,12 +170,20 @@ export default function SettingsPage() {
                 </span>
               </span>
             </div>
-            <Button variant="ghost" size="sm" asChild>
-              <Link href="/">
-                <ArrowLeft className="mr-2 h-4 w-4" />
-                Dashboard
-              </Link>
-            </Button>
+            <div className="flex items-center gap-1">
+              <Button variant="ghost" size="sm" asChild>
+                <Link href="/history">
+                  <History className="mr-2 h-4 w-4" />
+                  History
+                </Link>
+              </Button>
+              <Button variant="ghost" size="sm" asChild>
+                <Link href="/">
+                  <ArrowLeft className="mr-2 h-4 w-4" />
+                  Dashboard
+                </Link>
+              </Button>
+            </div>
           </div>
         </div>
       </header>
@@ -87,16 +203,57 @@ export default function SettingsPage() {
           </p>
         </div>
 
+        {/* Statistics Panel */}
+        <Card className="relative mb-8 shadow-md shadow-primary/5 ring-1 ring-border/30">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base flex items-center gap-2">
+              <BarChart3 className="h-4 w-4 text-primary" />
+              Statistics
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+              <StatTile
+                icon={<Activity className="h-4 w-4 text-emerald-500" />}
+                label="Fix Jobs Completed"
+                value={jobStats ? String(jobStats.completed) : "—"}
+                sub={jobStats ? `${jobStats.failed} failed` : undefined}
+              />
+              <StatTile
+                icon={<History className="h-4 w-4 text-blue-500" />}
+                label="Total Jobs"
+                value={jobStats ? String(jobStats.total) : "—"}
+              />
+              <StatTile
+                icon={<Database className="h-4 w-4 text-purple-500" />}
+                label="RAG Fix Examples"
+                value={ragStats ? String(ragStats.fix_examples) : "—"}
+                sub={ragStats ? `${ragStats.standard_docs} standard docs` : undefined}
+              />
+              <StatTile
+                icon={<Shield className="h-4 w-4 text-orange-500" />}
+                label="Connections Active"
+                value={String(Object.values(connectors).filter(c => c.status === "connected").length)}
+                sub="of 3 configured"
+              />
+            </div>
+          </CardContent>
+        </Card>
+
         {/* Connector Cards Overview */}
         <div className="relative grid gap-4 sm:grid-cols-3 mb-8">
           {Object.entries(connectors).map(([key, conn]) => {
             const meta = CONNECTOR_META[key]
             if (!meta) return null
+            const isTesting = testingConnectors[key]
+            const testResult = testResults[key]
             return (
               <Card
                 key={key}
                 className={`group transition-all duration-200 hover:shadow-lg hover:-translate-y-1 ${
-                  conn.status === "connected" ? "ring-1 ring-emerald-500/20 border-emerald-200/50" : "border-border/60"
+                  conn.status === "connected"
+                    ? "ring-1 ring-emerald-500/20 border-emerald-200/50"
+                    : "border-border/60"
                 }`}
               >
                 <CardHeader className="pb-3">
@@ -104,29 +261,61 @@ export default function SettingsPage() {
                     <div className={`flex h-12 w-12 items-center justify-center rounded-2xl ${meta.color} transition-transform duration-200 group-hover:scale-110`}>
                       <span className="text-xl">{meta.emoji}</span>
                     </div>
-                    {conn.status === "connected" ? (
-                      <Badge variant="outline" className="gap-1 border-emerald-500/20 bg-emerald-500/10 text-emerald-600">
-                        <CheckCircle2 className="h-3 w-3" />
-                        Connected
-                      </Badge>
-                    ) : (
-                      <Badge variant="outline" className="gap-1 text-muted-foreground">
-                        Not connected
-                      </Badge>
-                    )}
+                    <div className="flex items-center gap-2">
+                      <StatusDot status={testResult ? (testResult.success ? "connected" : "error") : conn.status} />
+                      {conn.status === "connected" ? (
+                        <Badge variant="outline" className="gap-1 border-emerald-500/20 bg-emerald-500/10 text-emerald-600 text-xs">
+                          <CheckCircle2 className="h-3 w-3" />
+                          Connected
+                        </Badge>
+                      ) : (
+                        <Badge variant="outline" className="gap-1 text-muted-foreground text-xs">
+                          Not connected
+                        </Badge>
+                      )}
+                    </div>
                   </div>
                   <CardTitle className="text-base font-bold">{conn.name}</CardTitle>
                   <CardDescription className="text-xs">{conn.description}</CardDescription>
                 </CardHeader>
                 <CardContent>
-                  <div className="flex items-center justify-between">
-                    {conn.status === "connected" ? (
-                      <span className="flex items-center gap-1 text-sm text-emerald-600">
-                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                        {conn.auth_type === "sso_saml" ? "SSO/SAML" : conn.auth_type === "token" ? "Token" : "Basic"}
-                      </span>
-                    ) : (
-                      <span className="text-sm text-muted-foreground">Not configured</span>
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      {conn.status === "connected" ? (
+                        <span className="flex items-center gap-1 text-sm text-emerald-600">
+                          <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                          {conn.auth_type === "sso_saml" ? "SSO/SAML" : conn.auth_type === "token" ? "Token" : "Basic"}
+                        </span>
+                      ) : (
+                        <span className="text-sm text-muted-foreground">Not configured</span>
+                      )}
+                    </div>
+                    {key === "llm" && conn.status === "connected" && conn.llm_model && (
+                      <p className="text-xs text-muted-foreground font-mono truncate" title={conn.llm_model}>
+                        {conn.llm_model}
+                      </p>
+                    )}
+                    {conn.status === "connected" && (
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 w-full gap-1 text-xs text-muted-foreground hover:text-foreground"
+                        onClick={() => quickTestConnector(key)}
+                        disabled={isTesting}
+                      >
+                        {isTesting
+                          ? <Loader2 className="h-3 w-3 animate-spin" />
+                          : <FlaskConical className="h-3 w-3" />}
+                        {isTesting ? "Testing…" : "Test connection"}
+                      </Button>
+                    )}
+                    {testResult && (
+                      <div className={`flex items-center gap-1.5 rounded p-1.5 text-xs ${testResult.success ? "bg-emerald-500/10 text-emerald-700" : "bg-destructive/10 text-destructive"}`}>
+                        {testResult.success
+                          ? <CheckCircle2 className="h-3 w-3 shrink-0" />
+                          : <XCircle className="h-3 w-3 shrink-0" />}
+                        <span className="truncate">{testResult.message}</span>
+                      </div>
                     )}
                   </div>
                 </CardContent>
@@ -227,18 +416,53 @@ export default function SettingsPage() {
                   </div>
                   <div className="space-y-2">
                     <Label>Model</Label>
-                    <Input name="llm_model" placeholder="Qwen/Qwen2.5-Coder-32B-Instruct" defaultValue="Qwen/Qwen2.5-Coder-32B-Instruct" />
+                    <Input
+                      name="llm_model"
+                      placeholder="Qwen/Qwen2.5-Coder-32B-Instruct"
+                      defaultValue={connectors.llm?.llm_model || "Qwen/Qwen2.5-Coder-32B-Instruct"}
+                    />
                     <p className="text-xs text-muted-foreground">
                       Must match a model served by your endpoint. Examples: Qwen/Qwen2.5-Coder-32B-Instruct, gpt-4o, etc.
                     </p>
                   </div>
                   <div className="space-y-2">
                     <Label>API Base URL</Label>
-                    <Input name="llm_base_url" placeholder="http://localhost:8000/v1" defaultValue="http://localhost:8000/v1" />
+                    <Input
+                      name="llm_base_url"
+                      placeholder="http://localhost:8000/v1"
+                      defaultValue={connectors.llm?.llm_base_url || "http://localhost:8000/v1"}
+                    />
                     <p className="text-xs text-muted-foreground">
                       OpenAI-compatible endpoint (e.g. vLLM, OpenAI, Azure OpenAI).
                     </p>
                   </div>
+
+                  {/* LLM Model info panel (read-only current config) */}
+                  {connectors.llm?.status === "connected" && (connectors.llm?.llm_model || connectors.llm?.llm_base_url) && (
+                    <div className="rounded-lg border border-border/50 bg-muted/30 p-3 space-y-1.5">
+                      <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Current Configuration</p>
+                      {connectors.llm?.llm_model && (
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-muted-foreground">Model</span>
+                          <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px]">{connectors.llm.llm_model}</code>
+                        </div>
+                      )}
+                      {connectors.llm?.llm_base_url && (
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-muted-foreground">Base URL</span>
+                          <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] max-w-[200px] truncate">{connectors.llm.llm_base_url}</code>
+                        </div>
+                      )}
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="text-muted-foreground">Temperature</span>
+                        <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px]">0.0 (deterministic)</code>
+                      </div>
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="text-muted-foreground">Max tokens</span>
+                        <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px]">8192</code>
+                      </div>
+                    </div>
+                  )}
                 </>
               )}
             />
@@ -303,6 +527,31 @@ export default function SettingsPage() {
           </TabsContent>
         </Tabs>
       </main>
+    </div>
+  )
+}
+
+
+// ---------------------------------------------------------------------------
+// StatTile — single statistic display
+// ---------------------------------------------------------------------------
+
+function StatTile({
+  icon, label, value, sub,
+}: {
+  icon: React.ReactNode
+  label: string
+  value: string
+  sub?: string
+}) {
+  return (
+    <div className="rounded-lg border border-border/50 bg-card p-3 space-y-1">
+      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        {icon}
+        <span>{label}</span>
+      </div>
+      <p className="text-2xl font-bold leading-none">{value}</p>
+      {sub && <p className="text-xs text-muted-foreground">{sub}</p>}
     </div>
   )
 }
