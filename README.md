@@ -1,3 +1,5 @@
+<div align="center">
+
 # SonarFix Agent
 
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white)
@@ -17,7 +19,42 @@ SonarFix closes that loop: it reads each SonarQube issue in context, sends the f
 
 ---
 
-## Architecture
+[![CI](https://github.com/madhupathy/sonarfix-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/madhupathy/sonarfix-agent/actions/workflows/ci.yml)
+[![Python 3.9+](https://img.shields.io/badge/Python-3.9+-3776AB?logo=python&logoColor=white)](https://python.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](pyproject.toml)
+
+</div>
+
+---
+
+## The Problem
+
+Every team with SonarQube has the same backlog. Hundreds of open issues — BUGs, VULNERABILITIEs, CODE_SMELLs — that everyone acknowledges but nobody fixes because:
+
+- **Each fix requires context**: open the file, find the issue, understand the rule, apply the fix
+- **Batch fixing is tedious**: 40 issues across 15 files means 15 separate PRs or one massive untraceable commit
+- **False positives waste time**: you have to preview issues before deciding what to automate
+- **LLM fixes break syntax**: naive "just ask GPT" approaches produce code that doesn't compile
+
+SonarFix Agent solves this with a pipeline that handles context intelligently, validates every fix before committing, and learns from past successes.
+
+---
+
+## Screenshots
+
+**Dashboard — preview issues and launch fix jobs**
+
+![SonarFix Dashboard](image.png)
+
+**Settings — configure SonarQube, LLM, and Git connections**
+
+![SonarFix Settings](image-1.png)
+
+---
+
+## How It Works
+
+Paste your PR URL. Preview the open SonarQube issues. Click Fix. The agent runs each file through a state-machine pipeline:
 
 ```
 SonarQube ──────────────────────────────────────────────────────────────────┐
@@ -63,6 +100,10 @@ pip install sonarfix-agent     # from PyPI (when published)
 
 ```bash
 uvicorn sonarfix.api:app --host 127.0.0.1 --port 8000 --reload
+
+# Terminal 2: frontend
+cd web && npm install && npm run dev
+# → http://localhost:3000
 ```
 
 **Step 3 — Start the web UI**
@@ -222,7 +263,7 @@ pip install "sonarfix-agent[embeddings]"
 
 ---
 
-## CLI Usage
+## Environment Variables
 
 ```bash
 # List issues for a project/branch
